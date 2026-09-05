@@ -139,6 +139,7 @@ export const POPULAR_MODELS: readonly string[] = [
 ];
 
 const STORAGE_KEYS = 'auraApi.keys';
+const STORAGE_STATUSES = 'auraApi.keyStatuses';
 const STORAGE_SELECTED = 'auraApi.chat.selectedKeyId';
 const SECRET_PREFIX = 'auraApi.key.';
 const HIGH_PING_MS = 3000;
@@ -175,6 +176,7 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 	private fingerprintSalt = '';
 	private readonly discoveryCache = new Map<string, { at: number; models: string[] }>();
 	private healthTimer: Timeout | undefined;
+	private staleCheckTimer: Timeout | undefined;
 
 	constructor(
 		@IStorageService private readonly storageService: IStorageService,
@@ -194,6 +196,10 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 			if (this.healthTimer !== undefined) {
 				clearTimeout(this.healthTimer);
 				this.healthTimer = undefined;
+			}
+			if (this.staleCheckTimer !== undefined) {
+				clearTimeout(this.staleCheckTimer);
+				this.staleCheckTimer = undefined;
 			}
 		}));
 	}
@@ -262,6 +268,37 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 		if (this.groups.length === 0) {
 			this.groups = [{ id: 'default', name: 'По умолчанию', priority: 0 }];
 		}
+		// Статусы восстанавливаются из хранилища: без этого после перезапуска окна
+		// все ключи считаются непроверенными, моделей в чате нет и он «не сразу работает».
+		try {
+			const rawS = this.storageService.get(STORAGE_STATUSES, StorageScope.APPLICATION, '{}');
+			for (const [id, status] of Object.entries(JSON.parse(rawS) as Record<string, IAuraApiKeyStatus>)) {
+				if (this.keys.some(k => k.id === id)) {
+					this.statuses.set(id, { ...status, checking: false });
+				}
+			}
+		} catch { /* повреждённый кэш статусов — просто перепроверим */ }
+
+		// Фоновая перепроверка: восстановленный статус мог устареть, но чат уже работает.
+		if (this.keys.length > 0) {
+			this.staleCheckTimer = setTimeout(() => {
+				this.staleCheckTimer = undefined;
+				for (const key of this.keys) {
+					const status = this.getStatus(key.id);
+					if (status.lastChecked === undefined || Date.now() - status.lastChecked > HEALTHY_RECHECK_MS) {
+						void this.checkLimiter.queue(() => this.checkKey(key.id));
+					}
+				}
+			}, 2_000);
+		}
+	}
+
+	private saveStatuses(): void {
+		const snapshot: Record<string, IAuraApiKeyStatus> = {};
+		for (const [id, status] of this.statuses) {
+			snapshot[id] = status;
+		}
+		this.storageService.store(STORAGE_STATUSES, JSON.stringify(snapshot), StorageScope.APPLICATION, StorageTarget.MACHINE);
 	}
 
 	private save(): void {
@@ -363,6 +400,9 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 			next.failureStreak = healthy ? 0 : (previous.failureStreak ?? 0) + 1;
 		}
 		this.statuses.set(id, next);
+		if (!next.checking) {
+			this.saveStatuses();
+		}
 		this._onDidChange.fire();
 		return next;
 	}
