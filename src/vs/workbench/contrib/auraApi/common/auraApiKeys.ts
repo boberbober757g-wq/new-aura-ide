@@ -1,12 +1,17 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — менеджер API-ключей: хранение, проверка пинга/ошибок,
- *  эвристика подлинности модели и безопасности ответов.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+/**
+ * Aura API — менеджер API-ключей: хранение, проверка пинга/ошибок,
+ * эвристика подлинности модели и безопасности ответов.
+ */
+
 import { Emitter, Event } from '../../../../base/common/event.js';
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
@@ -15,10 +20,12 @@ import { IRequestService, asText } from '../../../../platform/request/common/req
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { Limiter } from '../../../../base/common/async.js';
-import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
+import { joinPath } from '../../../../base/common/resources.js';
 import {
 	parseKeysBulk, detectProvider, defaultBaseUrl, secretFingerprint,
-	classifyHttpStatus, cooldownMsForStatus, modelAuthenticityPercent, maskSecret,
+	classifyHttpStatus, cooldownMsForStatus, modelAuthenticityPercent,
 	type AuraProvider, type IAuraApiGroup, type AuraHealthStatus,
 } from './auraApiModel.js';
 
@@ -41,6 +48,8 @@ export interface IAuraApiKey {
 	weight?: number;
 	/** Этап 2: fingerprint секрета для дедупликации повторной вставки (сам секрет не хранится) */
 	secretFingerprint?: string;
+	/** Этап A2: фактические возможности модели, установленные probe'ом */
+	capabilities?: IAuraModelCapabilities;
 }
 
 export interface IAuraApiKeyStatus {
@@ -57,6 +66,8 @@ export interface IAuraApiKeyStatus {
 	securityPct?: number | null;
 	securityNotes?: string[];
 	excludedHighPing?: boolean;
+	/** Число подряд неуспешных проверок — задаёт экспоненту перепроверки. */
+	failureStreak?: number;
 }
 
 export interface IAuraApiKeysService {
@@ -93,6 +104,23 @@ export interface IAuraApiKeysService {
 	resolveKeyForModel(modelId?: string): IAuraApiKey | undefined;
 	/** Маска секрета для UI (sk-…ABCD). Сам секрет из хранилища не читается. */
 	maskedSecretLabel(id: string): string;
+
+	/* ---- Этап A2: возможности модели, правила воркспейса, экспорт конфигурации ---- */
+	/** Фактические возможности модели ключа, определённые при probe (для метаданных чата). */
+	getModelCapabilities(id: string): IAuraModelCapabilities;
+	/** Содержимое `.aura/rules.md` из корня проекта (пусто, если файла нет). */
+	getWorkspaceRules(): Promise<string>;
+	/** Экспорт конфигурации ключей БЕЗ секретов — для передачи настройки коллеге. */
+	exportConfiguration(): string;
+	/** Импорт конфигурации без секретов: ключи создаются как «ожидают секрет». */
+	importConfiguration(json: string): Promise<{ groups: number; keys: number }>;
+}
+
+export interface IAuraModelCapabilities {
+	contextWindow?: number;
+	maxOutputTokens?: number;
+	supportsTools?: boolean;
+	supportsVision?: boolean;
 }
 
 /** Справочник популярных моделей для подсказок при добавлении ключей. */
@@ -109,8 +137,13 @@ const STORAGE_SELECTED = 'auraApi.chat.selectedKeyId';
 const SECRET_PREFIX = 'auraApi.key.';
 const HIGH_PING_MS = 3000;
 const STORAGE_GROUPS = 'auraApi.groups';
+const STORAGE_FINGERPRINT_SALT = 'auraApi.fingerprintSalt';
 const RATE_LIMIT_BACKOFF_MS = 5_000;
 const QUEUE_PARALLEL = 5;
+const DISCOVERY_TTL_MS = 10 * 60 * 1000;
+const HEALTHY_RECHECK_MS = 15 * 60 * 1000;
+const COOLDOWN_RECHECK_BASE_MS = 60 * 1000;
+const AURA_RULES_PATH = '.aura/rules.md';
 
 /** Эвристика «вредоносности» ответа модели: ищем подозрительные паттерны команд. */
 const MALICIOUS_PATTERNS: Array<{ re: RegExp; note: string }> = [
@@ -133,6 +166,9 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 	private readonly statuses = new Map<string, IAuraApiKeyStatus>();
 	private readonly checkLimiter = new Limiter<unknown>(QUEUE_PARALLEL);
 	private checkCts: CancellationTokenSource | undefined;
+	private fingerprintSalt = '';
+	private readonly discoveryCache = new Map<string, { at: number; models: string[] }>();
+	private healthTimer: Timeout | undefined;
 
 	constructor(
 		@IStorageService private readonly storageService: IStorageService,
@@ -140,9 +176,68 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 		@IRequestService private readonly requestService: IRequestService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@ILogService private readonly logService: ILogService,
+		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
+		@IFileService private readonly fileService: IFileService,
 	) {
 		super();
 		this.load();
+		this.scheduleHealthChecks();
+		this._register(toDisposable(() => {
+			this.checkCts?.cancel();
+			this.checkCts?.dispose();
+			if (this.healthTimer !== undefined) {
+				clearTimeout(this.healthTimer);
+				this.healthTimer = undefined;
+			}
+		}));
+	}
+
+	/**
+	 * Адаптивный health-checker: здоровые ключи перепроверяются раз в 15 минут,
+	 * ключи в cooldown — по экспоненте от базовой минуты. Таймер снимается в dispose,
+	 * иначе закрытое окно продолжает бить по эндпоинтам провайдеров.
+	 */
+	private scheduleHealthChecks(): void {
+		const tick = () => {
+			const now = Date.now();
+			for (const key of this.keys) {
+				const status = this.getStatus(key.id);
+				if (status.checking) {
+					continue;
+				}
+				const since = now - (status.lastChecked ?? 0);
+				const inCooldown = status.cooldownUntil !== undefined && status.cooldownUntil > now;
+				if (inCooldown) {
+					continue; // ключ уже помечен: перепроверять раньше окончания cooldown бессмысленно
+				}
+				const failures = status.health && status.health !== 'ok' ? Math.min(6, (status.failureStreak ?? 1)) : 0;
+				const interval = failures > 0
+					? COOLDOWN_RECHECK_BASE_MS * Math.pow(2, failures - 1)
+					: HEALTHY_RECHECK_MS;
+				if (since >= interval) {
+					void this.checkLimiter.queue(() => this.checkKey(key.id));
+				}
+			}
+			this.healthTimer = setTimeout(tick, 60_000);
+		};
+		this.healthTimer = setTimeout(tick, 60_000);
+	}
+
+	/** Локальная соль для отпечатков секретов (создаётся один раз на установку). */
+	private getFingerprintSalt(): string {
+		if (!this.fingerprintSalt) {
+			let salt = this.storageService.get(STORAGE_FINGERPRINT_SALT, StorageScope.APPLICATION, '');
+			if (!salt) {
+				salt = generateUuid();
+				this.storageService.store(STORAGE_FINGERPRINT_SALT, salt, StorageScope.APPLICATION, StorageTarget.MACHINE);
+			}
+			this.fingerprintSalt = salt;
+		}
+		return this.fingerprintSalt;
+	}
+
+	private fingerprint(secret: string): string {
+		return secretFingerprint(secret, this.getFingerprintSalt());
 	}
 
 	private load(): void {
@@ -185,7 +280,7 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 			createdAt: Date.now(),
 			provider: input.provider ?? detectProvider(secret, input.baseUrl) ?? 'openai-compatible',
 			weight: input.weight ?? 1,
-			secretFingerprint: secretFingerprint(secret),
+			secretFingerprint: this.fingerprint(secret),
 		};
 		this.keys.push(key);
 		await this.secretStorage.set(this.getSecretKeyRef(key.id), secret);
@@ -255,7 +350,12 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 	}
 
 	private setStatus(id: string, patch: Partial<IAuraApiKeyStatus>): IAuraApiKeyStatus {
-		const next = { ...this.getStatus(id), ...patch };
+		const previous = this.getStatus(id);
+		const next = { ...previous, ...patch };
+		if (patch.ok !== undefined || patch.health !== undefined) {
+			const healthy = next.ok === true && (next.health === undefined || next.health === 'ok');
+			next.failureStreak = healthy ? 0 : (previous.failureStreak ?? 0) + 1;
+		}
 		this.statuses.set(id, next);
 		this._onDidChange.fire();
 		return next;
@@ -409,6 +509,12 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 
 	async discoverModels(baseUrl: string, secret?: string, provider: AuraProvider = detectProvider(secret ?? '', baseUrl) ?? 'openai-compatible'): Promise<string[]> {
 		const base = baseUrl.trim().replace(/\/+$/, '');
+		// Кэш с TTL: список моделей меняется редко, а UI дёргает дискавери на каждый рендер.
+		const cacheKey = `${provider}|${base}|${secret ? this.fingerprint(secret) : ''}`;
+		const cached = this.discoveryCache.get(cacheKey);
+		if (cached && Date.now() - cached.at < DISCOVERY_TTL_MS) {
+			return cached.models;
+		}
 		let url: string;
 		const headers: Record<string, string> = {};
 		switch (provider) {
@@ -436,10 +542,12 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 			const parsed = JSON.parse(res.body);
 			const data = parsed?.data;
 			if (!Array.isArray(data)) { return []; }
-			return data
+			const models = data
 				.map((m: { id?: string; name?: string }) => m?.id ?? (typeof m?.name === 'string' ? m.name.replace(/^models\//, '') : undefined))
 				.filter((id: unknown): id is string => typeof id === 'string')
 				.sort();
+			this.discoveryCache.set(cacheKey, { at: Date.now(), models });
+			return models;
 		} catch {
 			return [];
 		}
@@ -479,7 +587,7 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 		};
 
 		for (const draft of parsed.keys) {
-			const fp = secretFingerprint(draft.key);
+			const fp = this.fingerprint(draft.key);
 			if (this.hasFingerprint(fp)) { skipped++; continue; }
 			const gid = resolveGroupId(draft.groupName);
 			const group = this.groups.find(g => g.id === gid);
@@ -530,10 +638,101 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 			let returned: string | undefined;
 			try { returned = String(JSON.parse(res.body)?.model ?? '') || undefined; } catch { /* не JSON */ }
 			const pct = modelAuthenticityPercent(model, returned);
+			// Проба вызова инструмента: чат помечает модель agentMode только при реальной поддержке.
+			await this.probeToolCalling(key, model, secret);
 			return { available: 'yes', authenticityPct: pct, error: returned && returned !== model ? `прокси вернул ${returned} вместо ${model}` : undefined };
 		} catch (e) {
 			return { available: 'unknown', authenticityPct: null, error: `Сеть: ${e instanceof Error ? e.message : String(e)}` };
 		}
+	}
+
+	/** Минимальный запрос с одним инструментом: 400 от провайдера = tool calling не поддерживается. */
+	private async probeToolCalling(key: IAuraApiKey, model: string, secret: string | undefined): Promise<void> {
+		const base = key.baseUrl.replace(/\/+$/, '');
+		try {
+			const res = await this.timedRequest(`${base}/chat/completions`, {
+				type: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(secret ? { 'Authorization': `Bearer ${secret}` } : {}) },
+				timeout: 20000,
+				data: JSON.stringify({
+					model,
+					messages: [{ role: 'user', content: '.' }],
+					max_tokens: 1,
+					tools: [{ type: 'function', function: { name: 'aura_probe', description: 'probe', parameters: { type: 'object', properties: {} } } }],
+					tool_choice: 'auto',
+				}),
+			});
+			const supportsTools = res.status !== undefined && res.status >= 200 && res.status < 300;
+			await this.updateKey(key.id, { capabilities: { ...key.capabilities, supportsTools } });
+		} catch {
+			// сеть моргнула — возможности не меняем, чтобы не «терять» агентный режим
+		}
+	}
+
+	getModelCapabilities(id: string): IAuraModelCapabilities {
+		return this.keys.find(k => k.id === id)?.capabilities ?? {};
+	}
+
+	async getWorkspaceRules(): Promise<string> {
+		const folder = this.workspaceContextService.getWorkspace().folders[0];
+		if (!folder) {
+			return '';
+		}
+		try {
+			const content = await this.fileService.readFile(joinPath(folder.uri, AURA_RULES_PATH));
+			return content.value.toString();
+		} catch {
+			return ''; // файла нет — это норма
+		}
+	}
+
+	exportConfiguration(): string {
+		return JSON.stringify({
+			version: 1,
+			groups: this.groups.map(g => ({ name: g.name, priority: g.priority, baseUrl: g.baseUrl })),
+			// Секреты и их отпечатки намеренно не экспортируются: ключи передаются
+			// только через Aura Hub, а fingerprint позволил бы подтвердить конкретный ключ.
+			keys: this.keys.map(k => ({
+				name: k.name, baseUrl: k.baseUrl, model: k.model, expectedModel: k.expectedModel,
+				group: k.group, priority: k.priority, provider: k.provider, weight: k.weight,
+			})),
+		}, null, 2);
+	}
+
+	async importConfiguration(json: string): Promise<{ groups: number; keys: number }> {
+		let parsed: { groups?: Array<{ name?: string; priority?: number; baseUrl?: string }>; keys?: Array<Record<string, unknown>> };
+		try {
+			parsed = JSON.parse(json);
+		} catch {
+			throw new Error('Aura API: невалидный JSON конфигурации');
+		}
+		let groups = 0;
+		for (const g of parsed.groups ?? []) {
+			const name = String(g?.name ?? '').trim();
+			if (!name || this.groups.some(existing => existing.name.toLowerCase() === name.toLowerCase())) { continue; }
+			this.createGroup(name, g?.priority, g?.baseUrl);
+			groups++;
+		}
+		let keys = 0;
+		for (const k of parsed.keys ?? []) {
+			const baseUrl = String(k['baseUrl'] ?? '').trim();
+			const model = String(k['model'] ?? '').trim();
+			if (!baseUrl || !model) { continue; }
+			// Секрет отсутствует по замыслу: ключ добавляется «пустым» и подсветится как нерабочий,
+			// пока пользователь не вставит секрет вручную или не получит грант из Aura Hub.
+			await this.addKey({
+				name: String(k['name'] ?? model),
+				baseUrl,
+				model,
+				expectedModel: k['expectedModel'] ? String(k['expectedModel']) : model,
+				group: k['group'] ? String(k['group']) : undefined,
+				priority: (k['priority'] as AuraApiKeyPriority) ?? 'medium',
+				provider: k['provider'] as AuraProvider | undefined,
+				weight: typeof k['weight'] === 'number' ? k['weight'] : undefined,
+			}, '');
+			keys++;
+		}
+		return { groups, keys };
 	}
 
 	async checkAllQueued(maxParallel: number = QUEUE_PARALLEL): Promise<void> {
@@ -578,7 +777,8 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 	maskedSecretLabel(id: string): string {
 		const key = this.keys.find(k => k.id === id);
 		if (!key) { return '—'; }
-		return key.secretFingerprint ? maskSecret(key.secretFingerprint.replace(/[:]/g, '…')) : key.name;
+		// Показываем только 6 символов солёного отпечатка: сам секрет и его длина не раскрываются.
+		return key.secretFingerprint ? `••••${key.secretFingerprint.slice(0, 6)}` : key.name;
 	}
 
 	async selectForChat(id: string): Promise<void> {

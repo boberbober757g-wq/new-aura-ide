@@ -1,9 +1,16 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — модель данных «имба-менеджера ключей» (Этап 2).
- *  Только чистые типы и функции: без DI, DOM и сети — покрывается юнит-тестами.
- *  Секреты сюда НЕ попадают в постоянное хранилище: секрет — только ISecretStorageService
- *  (ключ вида `auraApi.secret.<keyId>`), здесь — метаданные.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Aura API — модель данных «имба-менеджера ключей» (Этап 2).
+ * Только чистые типы и функции: без DI, DOM и сети — покрывается юнит-тестами.
+ * Секреты сюда НЕ попадают в постоянное хранилище: секрет — только ISecretStorageService
+ * (ключ вида `auraApi.secret.<keyId>`), здесь — метаданные.
+ */
+
+import { StringSHA1 } from '../../../../base/common/hash.js';
 
 export type AuraProvider = 'openai-compatible' | 'anthropic' | 'google' | 'openrouter' | 'litellm';
 
@@ -67,10 +74,18 @@ export function maskSecret(secret: string): string {
 	return `${s.slice(0, 3)}…${s.slice(-4)}`;
 }
 
-/** Синхронный отпечаток для дедупликации повторной вставки (без async-crypto). */
-export function secretFingerprint(secret: string): string {
-	const s = secret.trim();
-	return `${s.slice(0, 4)}:${s.length}:${s.slice(-4)}`;
+/**
+ * Отпечаток секрета для дедупликации повторной вставки.
+ * Солёный: без соли по значению из storage можно перебором подтвердить наличие
+ * конкретного ключа, а префикс+длина+хвост фактически раскрывали половину ключа.
+ * Соль генерируется локально при первом запуске и хранится рядом с ключами.
+ */
+export function secretFingerprint(secret: string, salt: string): string {
+	const sha = new StringSHA1();
+	sha.update(salt);
+	sha.update('\u0000');
+	sha.update(secret.trim());
+	return sha.digest();
 }
 
 /* -------------------------------- bulk parsing ------------------------------- */

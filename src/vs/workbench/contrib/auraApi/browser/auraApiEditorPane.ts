@@ -1,6 +1,9 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — центральная вкладка менеджера ключей (EditorPane + UI).
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/** Aura API — центральная вкладка менеджера ключей (EditorPane + UI). */
 
 import './media/auraApiEditor.css';
 import { $, append, addDisposableListener, EventType } from '../../../../base/browser/dom.js';

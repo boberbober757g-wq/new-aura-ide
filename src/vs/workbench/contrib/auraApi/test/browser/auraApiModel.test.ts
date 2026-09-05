@@ -1,7 +1,12 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — юнит-тесты ядра Этапа 2: bulk-парсер, классификатор HTTP, роутер.
- *  Запуск: ./scripts/test.sh (mocha, suite/test-глобалы).
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Aura API — юнит-тесты ядра Этапа 2: bulk-парсер, классификатор HTTP, роутер.
+ * Запуск: ./scripts/test.sh (mocha, suite/test-глобалы).
+ */
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -122,8 +127,11 @@ suite('AuraApiModel — провайдеры и секреты', () => {
 
 	test('маскирование и fingerprint', () => {
 		assert.strictEqual(maskSecret(SK), 'sk-…0ABCD');
-		assert.strictEqual(secretFingerprint(SK), secretFingerprint(SK));
-		assert.notStrictEqual(secretFingerprint(SK), secretFingerprint(SK2));
+		assert.strictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK, 'salt-1'));
+		assert.notStrictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK2, 'salt-1'));
+		// Соль обязательна: без неё отпечаток можно перебрать по значению из storage.
+		assert.notStrictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK, 'salt-2'));
+		assert.ok(!secretFingerprint(SK, 'salt-1').includes(SK.slice(0, 4)));
 		assert.strictEqual(auraSecretStorageKey('k1'), 'auraApi.secret.k1');
 		assert.ok(!auraSecretStorageKey('k1').includes(SK));
 	});
