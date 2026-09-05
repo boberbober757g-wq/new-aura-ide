@@ -50,6 +50,8 @@ export interface IAuraApiKey {
 	secretFingerprint?: string;
 	/** Этап A2: фактические возможности модели, установленные probe'ом */
 	capabilities?: IAuraModelCapabilities;
+	/** Этап A2: дополнительные модели этого ключа, доступные в пикере чата */
+	chatModels?: string[];
 }
 
 export interface IAuraApiKeyStatus {
@@ -108,6 +110,10 @@ export interface IAuraApiKeysService {
 	/* ---- Этап A2: возможности модели, правила воркспейса, экспорт конфигурации ---- */
 	/** Фактические возможности модели ключа, определённые при probe (для метаданных чата). */
 	getModelCapabilities(id: string): IAuraModelCapabilities;
+	/** Модели ключа, доступные в пикере чата (основная + добавленные пользователем). */
+	getChatModels(id: string): string[];
+	/** Заменить список моделей ключа для чата. */
+	setChatModels(id: string, models: string[]): Promise<void>;
 	/** Содержимое `.aura/rules.md` из корня проекта (пусто, если файла нет). */
 	getWorkspaceRules(): Promise<string>;
 	/** Экспорт конфигурации ключей БЕЗ секретов — для передачи настройки коллеге. */
@@ -424,22 +430,25 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 				});
 				if (chat.status !== undefined && chat.status >= 200 && chat.status < 300) {
 					let answer = '';
+					let returnedModel = '';
 					try {
 						const parsed = JSON.parse(chat.body);
 						answer = String(parsed?.choices?.[0]?.message?.content ?? '');
+						returnedModel = String(parsed?.model ?? '');
 					} catch { answer = chat.body; }
+
+					// Главный сигнал — поле `model` в ответе. Самоназвание модели ненадёжно:
+					// почти все модели обучены отвечать «я ChatGPT/ассистент» и не знают своего
+					// точного id, поэтому оно годится только как слабое подтверждение, когда
+					// упоминает ожидаемое семейство, и НИКОГДА не занижает оценку само по себе.
 					const expected = (key.expectedModel ?? key.model).toLowerCase();
-					const family = expected.split(/[-.]/).filter(w => w.length > 3);
+					const family = expected.split(/[-.\/]/).filter(w => w.length > 2);
 					const answerL = answer.toLowerCase();
-					if (answerL.includes(expected)) { authenticityPct = 100; }
-					else if (family.length > 0 && family.every(w => answerL.includes(w))) { authenticityPct = 80; }
-					else if (family.some(w => answerL.includes(w))) { authenticityPct = 50; }
-					else { authenticityPct = answer ? 20 : null; }
-					// Этап 2: основной сигнал — declared vs returned model из тела ответа
-					try {
-						const returnedModel = String(JSON.parse(chat.body)?.model ?? '');
-						if (returnedModel) { authenticityPct = modelAuthenticityPercent(key.model, returnedModel, authenticityPct ?? undefined); }
-					} catch { /* тело не JSON — оставляем эвристику */ }
+					const selfReportHint = answerL.includes(expected)
+						? 100
+						: (family.length > 0 && family.every(w => answerL.includes(w)) ? 80 : undefined);
+
+					authenticityPct = modelAuthenticityPercent(key.model, returnedModel || undefined, selfReportHint);
 
 					// 3. Безопасность: сканируем ответ модели на вредоносные паттерны
 					securityNotes = MALICIOUS_PATTERNS.filter(p => p.re.test(chat.body)).map(p => p.note);
@@ -671,6 +680,24 @@ export class AuraApiKeysService extends Disposable implements IAuraApiKeysServic
 
 	getModelCapabilities(id: string): IAuraModelCapabilities {
 		return this.keys.find(k => k.id === id)?.capabilities ?? {};
+	}
+
+	getChatModels(id: string): string[] {
+		const key = this.keys.find(k => k.id === id);
+		if (!key) {
+			return [];
+		}
+		// Основная модель всегда первая: она же используется при фейловере.
+		return [key.model, ...(key.chatModels ?? []).filter(m => m && m !== key.model)];
+	}
+
+	async setChatModels(id: string, models: string[]): Promise<void> {
+		const key = this.keys.find(k => k.id === id);
+		if (!key) {
+			return;
+		}
+		key.chatModels = [...new Set(models.map(m => m.trim()).filter(Boolean))];
+		this.save();
 	}
 
 	async getWorkspaceRules(): Promise<string> {

@@ -91,38 +91,51 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 	/* --------------------------------- метаданные ---------------------------------- */
 
 	async provideLanguageModelChatInfo(_options: ILanguageModelChatInfoOptions, _token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
-		const keys = this.usableKeys();
-		return keys.map((key, index) => {
-			const identifier = `${AURA_API_VENDOR}/${key.id}`;
+		const models: ILanguageModelChatMetadataAndIdentifier[] = [];
+		let isFirst = true;
+		for (const key of this.usableKeys()) {
 			const capabilities = this.keysService.getModelCapabilities?.(key.id) ?? {};
-			const metadata: ILanguageModelChatMetadata = {
-				extension: new ExtensionIdentifier('aura.aura-api'),
-				name: `${key.name} (${key.model})`,
-				id: key.id,
-				vendor: AURA_API_VENDOR,
-				version: '1.0.0',
-				family: key.model,
-				maxInputTokens: capabilities.contextWindow ?? 128000,
-				maxOutputTokens: capabilities.maxOutputTokens ?? 16000,
-				// Первый здоровый ключ становится моделью по умолчанию: без Copilot-аккаунта
-				// иначе в чате не выбрана ни одна модель и отправка молча ничего не делает.
-				isDefaultForLocation: index === 0 ? { panel: true, editor: true, terminal: true, notebook: true } : {},
-				isUserSelectable: true,
-				isBYOK: true,
-				tooltip: `Aura API: ${key.model} @ ${key.baseUrl}`,
-				capabilities: {
-					toolCalling: capabilities.supportsTools !== false,
-					agentMode: capabilities.supportsTools !== false,
-					vision: capabilities.supportsVision === true,
-				},
-			};
-			return { identifier, metadata };
-		});
+			// Группа ключа показывается в пикере, чтобы ключи из разных групп различались.
+			const groupName = key.group?.trim() || undefined;
+			// Ключ может обслуживать несколько моделей: в пикере они должны быть
+			// отдельными пунктами, иначе выбрать вторую модель ключа невозможно.
+			for (const model of this.keysService.getChatModels?.(key.id) ?? [key.model]) {
+				const metadata: ILanguageModelChatMetadata = {
+					extension: new ExtensionIdentifier('aura.aura-api'),
+					name: model,
+					id: `${key.id}::${model}`,
+					vendor: AURA_API_VENDOR,
+					version: '1.0.0',
+					family: model,
+					// Имя ключа во второй строке: несколько ключей на одну модель иначе неразличимы.
+					detail: groupName ? `${groupName} · ${key.name}` : key.name,
+					maxInputTokens: capabilities.contextWindow ?? 128000,
+					maxOutputTokens: capabilities.maxOutputTokens ?? 16000,
+					// Первая живая модель — по умолчанию: без Copilot-аккаунта иначе
+					// в чате не выбрана ни одна модель и отправка молча ничего не делает.
+					isDefaultForLocation: isFirst ? { panel: true, editor: true, terminal: true, notebook: true } : {},
+					isUserSelectable: true,
+					isBYOK: true,
+					tooltip: `Aura API: ${model} @ ${key.baseUrl}${groupName ? ` (группа «${groupName}»)` : ''}`,
+					capabilities: {
+						toolCalling: capabilities.supportsTools !== false,
+						agentMode: capabilities.supportsTools !== false,
+						vision: capabilities.supportsVision === true,
+					},
+				};
+				models.push({ identifier: `${AURA_API_VENDOR}/${metadata.id}`, metadata });
+				isFirst = false;
+			}
+		}
+		return models;
 	}
 
 	async sendChatRequest(modelId: string, messages: IChatMessage[], _from: ExtensionIdentifier | undefined, options: ILanguageModelChatRequestOptions, token: CancellationToken): Promise<ILanguageModelChatResponse> {
-		// modelId приходит как `<vendor>/<id>`; поддерживаем и голый id.
-		const requestedId = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+		// Идентификатор приходит как `<vendor>/<keyId>::<model>`; поддерживаем и голый id ключа.
+		const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+		const separator = bare.indexOf('::');
+		const requestedId = separator >= 0 ? bare.slice(0, separator) : bare;
+		const requestedModel = separator >= 0 ? bare.slice(separator + 2) : undefined;
 		const routed = this.keysService.resolveKeyForModel ? this.keysService.resolveKeyForModel() : undefined;
 		const preferred = this.keysService.getKeys().find(k => k.id === requestedId) ?? routed;
 		if (!preferred) { throw new Error(`Aura API: нет живых ключей (modelId=${modelId})`); }
@@ -155,6 +168,10 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 			for (const key of candidates) {
 				if (controller.signal.aborted) { break; }
 				let fullText = '';
+				// Модель из выбранного пункта пикера, но только если этот ключ её обслуживает:
+				// при фейловере на другой ключ берётся его собственная модель.
+				const keyModels = self.keysService.getChatModels?.(key.id) ?? [key.model];
+				const model = requestedModel && keyModels.includes(requestedModel) ? requestedModel : key.model;
 				try {
 					const secret = await self.keysService.getSecret(key.id);
 					const base = key.baseUrl.replace(/\/+$/, '');
@@ -165,7 +182,7 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 							...(secret ? { 'Authorization': `Bearer ${secret}` } : {}),
 						},
 						body: JSON.stringify({
-							model: key.model,
+							model,
 							messages: oaiMessages,
 							stream: true,
 							stream_options: { include_usage: true },
@@ -224,10 +241,10 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 					}
 					self.recordUsage({
 						keyId: key.id,
-						model: key.model,
+						model,
 						promptTokens,
 						completionTokens,
-						costUsd: estimateCostUsd(key.model, promptTokens, completionTokens),
+						costUsd: estimateCostUsd(model, promptTokens, completionTokens),
 						at: Date.now(),
 					});
 

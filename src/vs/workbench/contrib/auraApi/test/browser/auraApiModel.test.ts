@@ -159,10 +159,18 @@ suite('AuraApiModel — классификатор HTTP и cooldown', () => {
 
 	test('modelAuthenticityPercent: declared vs returned', () => {
 		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o'), 100);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o-mini'), 70);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'llama-3-8b'), 10);
+		// Регистр, разделители и префикс провайдера не влияют на совпадение.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'openai/GPT_4o'), 100);
+		// Версионный суффикс — та же модель, а не подмена.
+		assert.strictEqual(modelAuthenticityPercent('glm-5.3', 'glm-5.3-20260101'), 90);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o-mini'), 90);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o-2024', 'llama-3-8b'), 30);
+		// Молчание провайдера — «неизвестно», а не обвинение в подмене.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined), null);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', ''), null);
 		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined, 80), 80);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined), 50);
+		// Самоотчёт модели не должен занижать оценку ниже собственной эвристики.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'internal-route-7', 80), 80);
 	});
 });
 

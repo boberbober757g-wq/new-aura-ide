@@ -320,19 +320,35 @@ export function cooldownMsForStatus(status: number): number {
 /**
  * Проверка подлинности модели: прокси часто подменяют дорогую модель дешёвой.
  * Основной сигнал — сравнение запрошенного id с полем `model` в ответе.
+ *
+ * Важно: многие OpenAI-совместимые прокси вообще не возвращают `model` или возвращают
+ * собственный внутренний id (`gpt-4`, `default`, имя маршрута). Это не доказательство
+ * подмены, поэтому такой случай даёт «неизвестно» (null), а не низкий процент —
+ * иначе честный прокси выглядит мошенником.
  */
-export function modelAuthenticityPercent(requestedModel: string, returnedModel: string | undefined, heuristicPercent?: number): number {
-	if (returnedModel !== undefined) {
-		if (returnedModel === requestedModel) {
-			return 100;
-		}
-		const norm = (m: string) => m.toLowerCase().replace(/[-_.]/g, '');
-		if (norm(returnedModel).includes(norm(requestedModel)) || norm(requestedModel).includes(norm(returnedModel))) {
-			return 70; // семейство совпало (gpt-4o vs gpt-4o-mini)
-		}
-		return 10; // явная подмена
+export function modelAuthenticityPercent(requestedModel: string, returnedModel: string | undefined, heuristicPercent?: number): number | null {
+	const requested = requestedModel.trim();
+	const returned = returnedModel?.trim();
+	if (!returned) {
+		return heuristicPercent ?? null; // провайдер не сказал — не выдумываем число
 	}
-	return heuristicPercent ?? 50; // fallback: поведенческая эвристика
+	const norm = (m: string) => m.toLowerCase()
+		.replace(/^.*\//, '')       // openai/gpt-4o → gpt-4o
+		.replace(/[-_.\s]/g, '')
+		.replace(/(latest|preview|turbo)$/, '');
+	const a = norm(requested);
+	const b = norm(returned);
+	if (a === b) {
+		return 100;
+	}
+	if (a.startsWith(b) || b.startsWith(a)) {
+		return 90; // версионный суффикс: glm-5.3 vs glm-5.3-20260101
+	}
+	if (a.includes(b) || b.includes(a)) {
+		return 70; // одно семейство: gpt-4o vs gpt-4o-mini
+	}
+	// Явно другое имя — но это может быть внутренний id прокси, поэтому не ниже эвристики.
+	return heuristicPercent ?? 30;
 }
 
 /* --------------------------------- роутер ------------------------------------ */
