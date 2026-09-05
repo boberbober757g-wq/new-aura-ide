@@ -34,6 +34,7 @@ import { IThemeService } from '../../../../platform/theme/common/themeService.js
 import { IHoverService } from '../../../../platform/hover/browser/hover.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILanguageModelsService } from '../../chat/common/languageModels.js';
@@ -150,7 +151,14 @@ function registerAuraApiPlugin(instantiationService: IInstantiationService): voi
 		);
 		// Участник чата по умолчанию: без него панель не знает, кому отправлять запрос,
 		// и в Code – OSS без Copilot чат просто молчит.
-		registerAuraApiChatAgent(instantiationService, accessor.get(IChatAgentService));
+		try {
+			registerAuraApiChatAgent(instantiationService, accessor.get(IChatAgentService));
+			accessor.get(ILogService).info('[AuraAPI] чат-агент Aura зарегистрирован как участник по умолчанию');
+		} catch (e) {
+			// Регистрация падает, например, при дублировании id. Молчать нельзя:
+			// внешне это выглядит как «чат отвечает ошибкой Copilot без причины».
+			accessor.get(ILogService).error('[AuraAPI] не удалось зарегистрировать чат-агента', e);
+		}
 	});
 }
 
