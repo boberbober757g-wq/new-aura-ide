@@ -37,6 +37,8 @@ import { IStorageService, StorageScope } from '../../../../platform/storage/comm
 import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILanguageModelsService } from '../../chat/common/languageModels.js';
+import { IChatAgentService } from '../../chat/common/participants/chatAgents.js';
+import { registerAuraApiChatAgent } from './auraApiChatAgent.js';
 import { AuraApiEditorPane } from './auraApiEditorPane.js';
 import { AuraApiEditorInput, AuraApiEditorInputSerializer } from './auraApiEditorInput.js';
 import { AuraApiChatProvider, AURA_API_VENDOR, AURA_API_SYSTEM_PROMPT_SETTING, AURA_API_DAILY_BUDGET_SETTING } from './auraApiChatProvider.js';
@@ -146,6 +148,9 @@ function registerAuraApiPlugin(instantiationService: IInstantiationService): voi
 			AURA_API_VENDOR,
 			new AuraApiChatProvider(keysService, configurationService, storageService)
 		);
+		// Участник чата по умолчанию: без него панель не знает, кому отправлять запрос,
+		// и в Code – OSS без Copilot чат просто молчит.
+		registerAuraApiChatAgent(instantiationService, accessor.get(IChatAgentService));
 	});
 }
 
