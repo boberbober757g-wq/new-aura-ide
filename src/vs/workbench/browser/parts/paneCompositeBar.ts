@@ -86,11 +86,12 @@ export interface IPaneCompositeBarOptions {
 	readonly colors: (theme: IColorTheme) => ICompositeBarColors;
 }
 
-// Aura IDE fork: скрытые view-контейнеры не показываются в bar (регистрация сохраняется, открытие — командами)
+// Aura IDE fork: скрытые view-контейнеры не показываются в bar (регистрация сохраняется, открытие — командами).
+// Чат (`workbench.panel.chat`) намеренно НЕ скрыт: он живёт в правом сайдбаре и работает на ключах Aura API.
+// Контейнеры Copilot сюда не входят: встроенный Copilot вообще не загружается
+// (см. AURA_SKIPPED_BUILTIN_EXTENSIONS в platform/environment), поэтому и скрывать нечего.
 const AURA_HIDDEN_VIEW_CONTAINER_IDS = new Set<string>([
-	'workbench.view.debug', // Debug
-	'workbench.panel.chat', // Chat (ChatViewContainerId)
-	'copilot-chat', // Copilot "Chat Debug" (пустая иконка в bar)
+	'workbench.view.debug', // Run & Debug
 ]);
 
 // Aura IDE fork: контейнеры-лаунчеры — клик по иконке выполняет команду (открывает центральную вкладку), sidebar не открывается

@@ -1,35 +1,52 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — провайдер языковых моделей для встроенного чата.
- *  Каждый здоровый ключ (ok, без высокого пинга) появляется в списке моделей
- *  чата как BYOK-модель; запросы уходят на его OpenAI-совместимый эндпоинт.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Aura API — провайдер языковых моделей для встроенного чата.
+ * Каждый здоровый ключ (ok, без высокого пинга) появляется в списке моделей
+ * чата как BYOK-модель; запросы уходят на его OpenAI-совместимый эндпоинт.
+ */
 
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import {
 	ILanguageModelChatProvider, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatResponse,
 	ILanguageModelChatRequestOptions, ILanguageModelChatInfoOptions, ILanguageModelChatMetadata,
+	IChatResponsePart, IChatMessage,
 } from '../../chat/common/languageModels.js';
-import { IChatMessage } from '../../chat/common/languageModels.js';
 import { IAuraApiKeysService, IAuraApiKey } from '../common/auraApiKeys.js';
+import {
+	AuraSseParser, estimateCostUsd, estimateTokens, parseToolArguments, spentUsdSince,
+	toOpenAIMessages, toOpenAITools, toOpenAIToolChoice, type IAuraUsageRecord,
+} from '../common/auraApiChatProtocol.js';
 
 export const AURA_API_VENDOR = 'auraApi';
 export const AURA_API_SYSTEM_PROMPT_SETTING = 'auraApi.chat.systemPrompt';
+export const AURA_API_DAILY_BUDGET_SETTING = 'auraApi.chat.dailyBudgetUsd';
 
-interface IOpenAIMessage { role: string; content: string }
+const USAGE_STORAGE_KEY = 'auraApi.usage.records';
+const USAGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const USAGE_MAX_RECORDS = 2000;
 
 export class AuraApiChatProvider implements ILanguageModelChatProvider {
 
 	private readonly _onDidChange = new Emitter<void>();
 	readonly onDidChange: Event<void> = this._onDidChange.event;
 
+	private usageRecords: IAuraUsageRecord[] = [];
+
 	constructor(
 		private readonly keysService: IAuraApiKeysService,
 		private readonly configurationService: IConfigurationService,
+		private readonly storageService: IStorageService,
 	) {
 		this.keysService.onDidChange(() => this._onDidChange.fire());
+		this.loadUsage();
 	}
 
 	/** Здоровые ключи как модели чата. */
@@ -40,64 +57,121 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 		});
 	}
 
+	/* --------------------------------- учёт расхода -------------------------------- */
+
+	private loadUsage(): void {
+		try {
+			const raw = this.storageService.get(USAGE_STORAGE_KEY, StorageScope.APPLICATION, '[]');
+			const parsed = JSON.parse(raw) as IAuraUsageRecord[];
+			const cutoff = Date.now() - USAGE_RETENTION_MS;
+			this.usageRecords = Array.isArray(parsed) ? parsed.filter(r => r?.at > cutoff) : [];
+		} catch {
+			this.usageRecords = [];
+		}
+	}
+
+	private recordUsage(record: IAuraUsageRecord): void {
+		this.usageRecords.push(record);
+		if (this.usageRecords.length > USAGE_MAX_RECORDS) {
+			this.usageRecords = this.usageRecords.slice(-USAGE_MAX_RECORDS);
+		}
+		this.storageService.store(USAGE_STORAGE_KEY, JSON.stringify(this.usageRecords), StorageScope.APPLICATION, StorageTarget.MACHINE);
+	}
+
+	/** Расход по ключу за сутки — используется и лимитом, и колонкой расхода в менеджере. */
+	spentTodayUsd(keyId: string): number {
+		return spentUsdSince(this.usageRecords, keyId, Date.now());
+	}
+
+	private budgetExceeded(keyId: string): boolean {
+		const budget = this.configurationService.getValue<number>(AURA_API_DAILY_BUDGET_SETTING) ?? 0;
+		return budget > 0 && this.spentTodayUsd(keyId) >= budget;
+	}
+
+	/* --------------------------------- метаданные ---------------------------------- */
+
 	async provideLanguageModelChatInfo(_options: ILanguageModelChatInfoOptions, _token: CancellationToken): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
-		return this.usableKeys().map(key => {
-			const identifier = `${AURA_API_VENDOR}/${key.id}`;
-			const metadata: ILanguageModelChatMetadata = {
-				extension: new ExtensionIdentifier('aura.aura-api'),
-				name: `${key.name} (${key.model})`,
-				id: key.id,
-				vendor: AURA_API_VENDOR,
-				version: '1.0.0',
-				family: key.model,
-				maxInputTokens: 128000,
-				maxOutputTokens: 16000,
-				isDefaultForLocation: {},
-				isUserSelectable: true,
-				isBYOK: true,
-				tooltip: `Aura API: ${key.model} @ ${key.baseUrl}`,
-				capabilities: { toolCalling: true, agentMode: true },
-			};
-			return { identifier, metadata };
-		});
+		const models: ILanguageModelChatMetadataAndIdentifier[] = [];
+		let isFirst = true;
+		for (const key of this.usableKeys()) {
+			const capabilities = this.keysService.getModelCapabilities?.(key.id) ?? {};
+			// Группа ключа показывается в пикере, чтобы ключи из разных групп различались.
+			const groupName = key.group?.trim() || undefined;
+			// Ключ может обслуживать несколько моделей: в пикере они должны быть
+			// отдельными пунктами, иначе выбрать вторую модель ключа невозможно.
+			for (const model of this.keysService.getChatModels?.(key.id) ?? [key.model]) {
+				const metadata: ILanguageModelChatMetadata = {
+					extension: new ExtensionIdentifier('aura.aura-api'),
+					name: model,
+					id: `${key.id}::${model}`,
+					vendor: AURA_API_VENDOR,
+					version: '1.0.0',
+					family: model,
+					// Имя ключа во второй строке: несколько ключей на одну модель иначе неразличимы.
+					detail: groupName ? `${groupName} · ${key.name}` : key.name,
+					maxInputTokens: capabilities.contextWindow ?? 128000,
+					maxOutputTokens: capabilities.maxOutputTokens ?? 16000,
+					// Первая живая модель — по умолчанию: без Copilot-аккаунта иначе
+					// в чате не выбрана ни одна модель и отправка молча ничего не делает.
+					isDefaultForLocation: isFirst ? { panel: true, editor: true, terminal: true, notebook: true } : {},
+					isUserSelectable: true,
+					isBYOK: true,
+					tooltip: `Aura API: ${model} @ ${key.baseUrl}${groupName ? ` (группа «${groupName}»)` : ''}`,
+					capabilities: {
+						toolCalling: capabilities.supportsTools !== false,
+						agentMode: capabilities.supportsTools !== false,
+						vision: capabilities.supportsVision === true,
+					},
+				};
+				models.push({ identifier: `${AURA_API_VENDOR}/${metadata.id}`, metadata });
+				isFirst = false;
+			}
+		}
+		return models;
 	}
 
 	async sendChatRequest(modelId: string, messages: IChatMessage[], _from: ExtensionIdentifier | undefined, options: ILanguageModelChatRequestOptions, token: CancellationToken): Promise<ILanguageModelChatResponse> {
-		// Выбор ключа через роутер (группы → веса → cooldown), fallback — старый список
+		// Идентификатор приходит как `<vendor>/<keyId>::<model>`; поддерживаем и голый id ключа.
+		const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+		const separator = bare.indexOf('::');
+		const requestedId = separator >= 0 ? bare.slice(0, separator) : bare;
+		const requestedModel = separator >= 0 ? bare.slice(separator + 2) : undefined;
 		const routed = this.keysService.resolveKeyForModel ? this.keysService.resolveKeyForModel() : undefined;
-		const preferred = this.keysService.getKeys().find(k => k.id === modelId) ?? routed;
+		const preferred = this.keysService.getKeys().find(k => k.id === requestedId) ?? routed;
 		if (!preferred) { throw new Error(`Aura API: нет живых ключей (modelId=${modelId})`); }
-		const candidates: IAuraApiKey[] = [preferred, ...this.usableKeys().filter(k => k.id !== preferred.id)];
-
-		const systemPrompt = (this.configurationService.getValue<string>(AURA_API_SYSTEM_PROMPT_SETTING) ?? '').trim();
-		const oaiMessages: IOpenAIMessage[] = [];
-		if (systemPrompt) {
-			oaiMessages.push({ role: 'system', content: systemPrompt });
-		}
-		for (const m of messages) {
-			const text = m.content
-				.map(part => (part as { type?: string; value?: unknown }).type === 'text' ? String((part as { value: unknown }).value) : '')
-				.filter(Boolean)
-				.join('\n');
-			if (!text) { continue; }
-			oaiMessages.push({ role: m.role === 1 /* User */ ? 'user' : 'assistant', content: text });
+		const candidates: IAuraApiKey[] = [preferred, ...this.usableKeys().filter(k => k.id !== preferred.id)]
+			.filter(k => !this.budgetExceeded(k.id));
+		if (candidates.length === 0) {
+			throw new Error('Aura API: дневной бюджет исчерпан по всем ключам (auraApi.chat.dailyBudgetUsd)');
 		}
 
+		const systemPrompt = await this.resolveSystemPrompt();
+		const oaiMessages = toOpenAIMessages(messages as unknown as ReadonlyArray<{ role: number; content: readonly { type?: string; value?: unknown; name?: string; toolCallId?: string; parameters?: unknown }[] }>, systemPrompt);
+		const tools = toOpenAITools(options.tools as readonly unknown[] | undefined);
+		const toolChoice = toOpenAIToolChoice(options.toolMode as number | undefined, !!tools);
 
 		const controller = new AbortController();
 		token.onCancellationRequested(() => controller.abort());
 
-		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		// Генератор ниже — не метод класса, ему нужен явный доступ к сервисам провайдера.
 		const self = this;
 		let resolveResult!: (v: string) => void;
 		let rejectResult!: (e: unknown) => void;
 		const result = new Promise<string>((res, rej) => { resolveResult = res; rejectResult = rej; });
+		// Потребители читают stream и часто не ждут result: без no-op обработчика
+		// его отклонение всплывает как unhandled rejection.
+		result.catch(() => { });
 
-		const stream = (async function* () {
+		const stream = (async function* (): AsyncIterable<IChatResponsePart> {
 			let lastError: unknown;
 			let yielded = false; // стрим начался — фейловер на другой ключ уже невозможен (иначе дубли текста)
 			for (const key of candidates) {
 				if (controller.signal.aborted) { break; }
+				let fullText = '';
+				// Модель из выбранного пункта пикера, но только если этот ключ её обслуживает:
+				// при фейловере на другой ключ берётся его собственная модель.
+				const keyModels = self.keysService.getChatModels?.(key.id) ?? [key.model];
+				const model = requestedModel && keyModels.includes(requestedModel) ? requestedModel : key.model;
 				try {
 					const secret = await self.keysService.getSecret(key.id);
 					const base = key.baseUrl.replace(/\/+$/, '');
@@ -107,44 +181,84 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 							'Content-Type': 'application/json',
 							...(secret ? { 'Authorization': `Bearer ${secret}` } : {}),
 						},
-						body: JSON.stringify({ model: key.model, messages: oaiMessages, stream: true }),
+						body: JSON.stringify({
+							model,
+							messages: oaiMessages,
+							stream: true,
+							stream_options: { include_usage: true },
+							...(tools ? { tools, tool_choice: toolChoice } : {}),
+							...(options.modelOptions ?? {}),
+						}),
 						signal: controller.signal,
 					});
 					if (!response.ok || !response.body) {
 						const body = await response.text().catch(() => '');
 						throw new Error(`Aura API [${key.name}]: HTTP ${response.status} — ${body.slice(0, 200)}`);
 					}
-					// SSE: читаем дельты и репортим их по мере поступления
+
 					const reader = response.body.getReader();
 					const decoder = new TextDecoder();
-					let buffer = '';
-					let fullText = '';
-					for (;;) {
+					const parser = new AuraSseParser();
+					let promptTokens = 0;
+					let completionTokens = 0;
+
+					for (; ;) {
 						const { done, value } = await reader.read();
-						if (done) { break; }
-						buffer += decoder.decode(value, { stream: true });
-						const lines = buffer.split('\n');
-						buffer = lines.pop() ?? '';
-						for (const line of lines) {
-							const trimmedLine = line.trim();
-							if (!trimmedLine.startsWith('data:')) { continue; }
-							const payload = trimmedLine.slice(5).trim();
-							if (payload === '[DONE]') { continue; }
-							try {
-								const json = JSON.parse(payload);
-								const delta = json?.choices?.[0]?.delta?.content;
-								if (typeof delta === 'string' && delta.length > 0) {
-									fullText += delta;
+						const events = done
+							? parser.flush()
+							: parser.push(decoder.decode(value, { stream: true }));
+						for (const event of events) {
+							switch (event.kind) {
+								case 'text':
+									fullText += event.value;
 									yielded = true;
-									yield { type: 'text' as const, value: delta };
-								}
-							} catch { /* неполный JSON-чанк — пропускаем */ }
+									yield { type: 'text', value: event.value };
+									break;
+								case 'tool_call':
+									yielded = true;
+									yield {
+										type: 'tool_use',
+										name: event.call.name,
+										toolCallId: event.call.toolCallId || `aura-${key.id}-${event.call.name}`,
+										parameters: parseToolArguments(event.call.argumentsText),
+									};
+									break;
+								case 'usage':
+									promptTokens = event.usage.promptTokens;
+									completionTokens = event.usage.completionTokens;
+									break;
+								case 'done':
+									break;
+							}
 						}
+						if (done) { break; }
 					}
+
+					if (promptTokens === 0 && completionTokens === 0) {
+						// Провайдер не прислал usage — считаем локальной оценкой, чтобы бюджет не был слепым.
+						promptTokens = estimateTokens(oaiMessages.map(m => m.content ?? '').join('\n'));
+						completionTokens = estimateTokens(fullText);
+					}
+					self.recordUsage({
+						keyId: key.id,
+						model,
+						promptTokens,
+						completionTokens,
+						costUsd: estimateCostUsd(model, promptTokens, completionTokens),
+						at: Date.now(),
+					});
+
 					resolveResult(fullText);
 					return;
 				} catch (e) {
-					if (yielded) { rejectResult(e); throw e; }
+					if (yielded) {
+						// Обрыв после начала генерации: молча переключать ключ нельзя — получится
+						// склейка двух разных ответов. Отдаём маркер и сохраняем уже полученный текст.
+						const message = e instanceof Error ? e.message : String(e);
+						yield { type: 'text', value: `\n\n⚠️ Aura API: поток прерван (${message}). Ответ сохранён; повторите запрос — он уйдёт на другой ключ.` };
+						resolveResult(fullText);
+						return;
+					}
 					lastError = e; // ошибка до первого байта — пробуем следующий ключ
 				}
 			}
@@ -156,10 +270,17 @@ export class AuraApiChatProvider implements ILanguageModelChatProvider {
 		return { stream, result };
 	}
 
+	/** Системный промпт: настройка + `.aura/rules.md` воркспейса, если он подхвачен сервисом ключей. */
+	private async resolveSystemPrompt(): Promise<string> {
+		const configured = (this.configurationService.getValue<string>(AURA_API_SYSTEM_PROMPT_SETTING) ?? '').trim();
+		const workspaceRules = (await this.keysService.getWorkspaceRules?.()) ?? '';
+		return [configured, workspaceRules.trim()].filter(Boolean).join('\n\n');
+	}
+
 	async provideTokenCount(_modelId: string, message: string | IChatMessage, _token: CancellationToken): Promise<number> {
 		const text = typeof message === 'string'
 			? message
-			: message.content.map(p => String((p as { value?: unknown }).value ?? '')).join(' ');
-		return Math.ceil(text.length / 4); // приблизительная оценка токенов
+			: message.content.map(p => typeof (p as { value?: unknown }).value === 'string' ? (p as { value: string }).value : '').join(' ');
+		return estimateTokens(text);
 	}
 }

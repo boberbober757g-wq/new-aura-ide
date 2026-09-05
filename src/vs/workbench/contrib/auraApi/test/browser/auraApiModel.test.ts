@@ -1,7 +1,12 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — юнит-тесты ядра Этапа 2: bulk-парсер, классификатор HTTP, роутер.
- *  Запуск: ./scripts/test.sh (mocha, suite/test-глобалы).
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Aura API — юнит-тесты ядра Этапа 2: bulk-парсер, классификатор HTTP, роутер.
+ * Запуск: ./scripts/test.sh (mocha, suite/test-глобалы).
+ */
 
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -122,8 +127,11 @@ suite('AuraApiModel — провайдеры и секреты', () => {
 
 	test('маскирование и fingerprint', () => {
 		assert.strictEqual(maskSecret(SK), 'sk-…0ABCD');
-		assert.strictEqual(secretFingerprint(SK), secretFingerprint(SK));
-		assert.notStrictEqual(secretFingerprint(SK), secretFingerprint(SK2));
+		assert.strictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK, 'salt-1'));
+		assert.notStrictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK2, 'salt-1'));
+		// Соль обязательна: без неё отпечаток можно перебрать по значению из storage.
+		assert.notStrictEqual(secretFingerprint(SK, 'salt-1'), secretFingerprint(SK, 'salt-2'));
+		assert.ok(!secretFingerprint(SK, 'salt-1').includes(SK.slice(0, 4)));
 		assert.strictEqual(auraSecretStorageKey('k1'), 'auraApi.secret.k1');
 		assert.ok(!auraSecretStorageKey('k1').includes(SK));
 	});
@@ -151,10 +159,18 @@ suite('AuraApiModel — классификатор HTTP и cooldown', () => {
 
 	test('modelAuthenticityPercent: declared vs returned', () => {
 		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o'), 100);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o-mini'), 70);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'llama-3-8b'), 10);
+		// Регистр, разделители и префикс провайдера не влияют на совпадение.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'openai/GPT_4o'), 100);
+		// Версионный суффикс — та же модель, а не подмена.
+		assert.strictEqual(modelAuthenticityPercent('glm-5.3', 'glm-5.3-20260101'), 90);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'gpt-4o-mini'), 90);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o-2024', 'llama-3-8b'), 30);
+		// Молчание провайдера — «неизвестно», а не обвинение в подмене.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined), null);
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', ''), null);
 		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined, 80), 80);
-		assert.strictEqual(modelAuthenticityPercent('gpt-4o', undefined), 50);
+		// Самоотчёт модели не должен занижать оценку ниже собственной эвристики.
+		assert.strictEqual(modelAuthenticityPercent('gpt-4o', 'internal-route-7', 80), 80);
 	});
 });
 

@@ -1,9 +1,16 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — модель данных «имба-менеджера ключей» (Этап 2).
- *  Только чистые типы и функции: без DI, DOM и сети — покрывается юнит-тестами.
- *  Секреты сюда НЕ попадают в постоянное хранилище: секрет — только ISecretStorageService
- *  (ключ вида `auraApi.secret.<keyId>`), здесь — метаданные.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Aura API — модель данных «имба-менеджера ключей» (Этап 2).
+ * Только чистые типы и функции: без DI, DOM и сети — покрывается юнит-тестами.
+ * Секреты сюда НЕ попадают в постоянное хранилище: секрет — только ISecretStorageService
+ * (ключ вида `auraApi.secret.<keyId>`), здесь — метаданные.
+ */
+
+import { StringSHA1 } from '../../../../base/common/hash.js';
 
 export type AuraProvider = 'openai-compatible' | 'anthropic' | 'google' | 'openrouter' | 'litellm';
 
@@ -67,10 +74,18 @@ export function maskSecret(secret: string): string {
 	return `${s.slice(0, 3)}…${s.slice(-4)}`;
 }
 
-/** Синхронный отпечаток для дедупликации повторной вставки (без async-crypto). */
-export function secretFingerprint(secret: string): string {
-	const s = secret.trim();
-	return `${s.slice(0, 4)}:${s.length}:${s.slice(-4)}`;
+/**
+ * Отпечаток секрета для дедупликации повторной вставки.
+ * Солёный: без соли по значению из storage можно перебором подтвердить наличие
+ * конкретного ключа, а префикс+длина+хвост фактически раскрывали половину ключа.
+ * Соль генерируется локально при первом запуске и хранится рядом с ключами.
+ */
+export function secretFingerprint(secret: string, salt: string): string {
+	const sha = new StringSHA1();
+	sha.update(salt);
+	sha.update('\u0000');
+	sha.update(secret.trim());
+	return sha.digest();
 }
 
 /* -------------------------------- bulk parsing ------------------------------- */
@@ -305,19 +320,35 @@ export function cooldownMsForStatus(status: number): number {
 /**
  * Проверка подлинности модели: прокси часто подменяют дорогую модель дешёвой.
  * Основной сигнал — сравнение запрошенного id с полем `model` в ответе.
+ *
+ * Важно: многие OpenAI-совместимые прокси вообще не возвращают `model` или возвращают
+ * собственный внутренний id (`gpt-4`, `default`, имя маршрута). Это не доказательство
+ * подмены, поэтому такой случай даёт «неизвестно» (null), а не низкий процент —
+ * иначе честный прокси выглядит мошенником.
  */
-export function modelAuthenticityPercent(requestedModel: string, returnedModel: string | undefined, heuristicPercent?: number): number {
-	if (returnedModel !== undefined) {
-		if (returnedModel === requestedModel) {
-			return 100;
-		}
-		const norm = (m: string) => m.toLowerCase().replace(/[-_.]/g, '');
-		if (norm(returnedModel).includes(norm(requestedModel)) || norm(requestedModel).includes(norm(returnedModel))) {
-			return 70; // семейство совпало (gpt-4o vs gpt-4o-mini)
-		}
-		return 10; // явная подмена
+export function modelAuthenticityPercent(requestedModel: string, returnedModel: string | undefined, heuristicPercent?: number): number | null {
+	const requested = requestedModel.trim();
+	const returned = returnedModel?.trim();
+	if (!returned) {
+		return heuristicPercent ?? null; // провайдер не сказал — не выдумываем число
 	}
-	return heuristicPercent ?? 50; // fallback: поведенческая эвристика
+	const norm = (m: string) => m.toLowerCase()
+		.replace(/^.*\//, '')       // openai/gpt-4o → gpt-4o
+		.replace(/[-_.\s]/g, '')
+		.replace(/(latest|preview|turbo)$/, '');
+	const a = norm(requested);
+	const b = norm(returned);
+	if (a === b) {
+		return 100;
+	}
+	if (a.startsWith(b) || b.startsWith(a)) {
+		return 90; // версионный суффикс: glm-5.3 vs glm-5.3-20260101
+	}
+	if (a.includes(b) || b.includes(a)) {
+		return 70; // одно семейство: gpt-4o vs gpt-4o-mini
+	}
+	// Явно другое имя — но это может быть внутренний id прокси, поэтому не ниже эвристики.
+	return heuristicPercent ?? 30;
 }
 
 /* --------------------------------- роутер ------------------------------------ */

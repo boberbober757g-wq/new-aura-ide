@@ -1,6 +1,9 @@
 /*---------------------------------------------------------------------------------------------
- *  Aura API — центральная вкладка менеджера ключей (EditorPane + UI).
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/** Aura API — центральная вкладка менеджера ключей (EditorPane + UI). */
 
 import './media/auraApiEditor.css';
 import { $, append, addDisposableListener, EventType } from '../../../../base/browser/dom.js';
@@ -10,6 +13,7 @@ import { ITelemetryService } from '../../../../platform/telemetry/common/telemet
 import { IThemeService } from '../../../../platform/theme/common/themeService.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
 import { IEditorGroup } from '../../../services/editor/common/editorGroupsService.js';
 import { AuraApiEditorInput } from './auraApiEditorInput.js';
 import { IAuraApiKeysService, IAuraApiKey, AuraApiKeyPriority } from '../common/auraApiKeys.js';
@@ -30,6 +34,7 @@ export class AuraApiEditorPane extends EditorPane {
 		@IStorageService storageService: IStorageService,
 		@IAuraApiKeysService private readonly keysService: IAuraApiKeysService,
 		@INotificationService private readonly notificationService: INotificationService,
+		@IQuickInputService private readonly quickInputService: IQuickInputService,
 	) {
 		super(AuraApiEditorPane.ID, group, telemetryService, themeService, storageService);
 		this._register(this.keysService.onDidChange(() => this.renderTable()));
@@ -169,6 +174,7 @@ export class AuraApiEditorPane extends EditorPane {
 			const actions = append(row, $('td.aura-api-actions'));
 			this.mkRowButton(actions, 'Проверить', () => void this.keysService.checkKey(key.id));
 			this.mkRowButton(actions, 'Probe', () => this.probeKey(key));
+			this.mkRowButton(actions, 'Модели', () => this.editChatModels(key));
 			this.mkRowButton(actions, 'В чат', () => this.selectForChat(key));
 			this.mkRowButton(actions, 'Удалить', () => void this.keysService.removeKey(key.id));
 		}
@@ -186,6 +192,26 @@ export class AuraApiEditorPane extends EditorPane {
 			? `Модель ${key.model} доступна, подлинность ${r.authenticityPct ?? '—'}%${r.error ? ` (${r.error})` : ''}`
 			: `Модель ${key.model}: ${r.available} — ${r.error ?? 'нет данных'}`;
 		if (r.available === 'yes') { this.notificationService.info(msg); } else { this.notificationService.warn(msg); }
+	}
+
+	private async editChatModels(key: IAuraApiKey): Promise<void> {
+		const secret = await this.keysService.getSecret(key.id);
+		const discovered = await this.keysService.discoverModels(key.baseUrl, secret, key.provider);
+		const selected = new Set(this.keysService.getChatModels(key.id));
+		const candidates = [...new Set([...selected, ...discovered])].sort();
+		if (candidates.length === 0) {
+			this.notificationService.warn(`У «${key.name}» не удалось получить список моделей (${key.baseUrl}/models).`);
+			return;
+		}
+		const picked = await this.quickInputService.pick(
+			candidates.map(model => ({ label: model, picked: selected.has(model), description: model === key.model ? 'основная' : undefined })),
+			{ canPickMany: true, title: `Модели ключа «${key.name}» в чате`, placeHolder: 'Отмеченные модели появятся в пикере моделей чата' },
+		);
+		if (!picked) {
+			return;
+		}
+		await this.keysService.setChatModels(key.id, picked.map(item => item.label));
+		this.notificationService.info(`«${key.name}»: в чате доступно моделей — ${this.keysService.getChatModels(key.id).length}.`);
 	}
 
 	private checkGroup(): void {

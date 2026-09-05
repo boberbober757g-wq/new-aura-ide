@@ -31,6 +31,13 @@ import { ChatPerfMark, markChat } from '../chatPerf.js';
 
 //#region agent service, commands etc
 
+/**
+ * Aura IDE fork: id участника чата, работающего на ключах Aura API.
+ * Объявлен здесь, а не импортирован из contrib/auraApi, чтобы не создавать
+ * зависимость слоя chat/common от плагина (и не ломать rebase на upstream).
+ */
+const AURA_CHAT_AGENT_ID = 'aura.api.chat';
+
 export interface IChatAgentHistoryEntry {
 	request: IChatAgentRequest;
 	response: ReadonlyArray<IChatProgressHistoryResponseContent | IChatTaskDto>;
@@ -471,6 +478,15 @@ export class ChatAgentService extends Disposable implements IChatAgentService {
 	}
 
 	private _preferExtensionAgent<T extends IChatAgentData>(agents: T[]): T | undefined {
+		// Aura IDE fork: собственный участник чата (на ключах Aura API) имеет приоритет над
+		// участником от расширения. Иначе Copilot-агент, зарегистрированный расширением,
+		// перехватывает каждый запрос и отвечает «Language model unavailable», потому что
+		// требует вход в аккаунт, — а ключи пользователя остаются неиспользованными.
+		const auraAgent = agents.find(agent => agent.id === AURA_CHAT_AGENT_ID);
+		if (auraAgent) {
+			return auraAgent;
+		}
+
 		// We potentially have multiple agents on the same location,
 		// contributed from core and from extensions.
 		// This method will prefer the last extensions provided agent
