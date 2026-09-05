@@ -16,6 +16,15 @@ import { IProductService } from '../../product/common/productService.js';
 
 export const EXTENSION_IDENTIFIER_WITH_LOG_REGEX = /^([^.]+\..+)[:=](.+)$/;
 
+/**
+ * Aura IDE fork: встроенные расширения, которые никогда не загружаются в этой сборке.
+ * Переопределяется переменной окружения VSCODE_SKIP_BUILTIN_EXTENSIONS.
+ */
+const AURA_SKIPPED_BUILTIN_EXTENSIONS: readonly string[] = [
+	'GitHub.copilot',
+	'GitHub.copilot-chat',
+];
+
 export interface INativeEnvironmentPaths {
 
 	/**
@@ -219,7 +228,11 @@ export abstract class AbstractNativeEnvironmentService implements INativeEnviron
 	get skipBuiltinExtensions(): readonly string[] {
 		const value = env['VSCODE_SKIP_BUILTIN_EXTENSIONS'];
 		if (!value) {
-			return [];
+			// Aura IDE fork: встроенный Copilot не загружается.
+			// Он регистрирует участника чата, который перехватывает каждый запрос и падает с
+			// «Language model unavailable» без входа в аккаунт, свой контейнер «Chat Debug»
+			// в activity bar и собственные модели в списке. Всё это заменяет плагин Aura API.
+			return AURA_SKIPPED_BUILTIN_EXTENSIONS;
 		}
 		return value.split(',').map(id => id.trim()).filter(id => id);
 	}
